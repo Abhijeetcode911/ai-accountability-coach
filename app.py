@@ -1,61 +1,103 @@
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 from openai import OpenAI
+from google.cloud import firestore
 import os
-import sqlite3
 import smtplib
 import time
 from email.mime.text import MIMEText
 from datetime import datetime
 from dotenv import load_dotenv
-from db import init_db
 
 # -------------------------
 # INIT
 # -------------------------
 
 load_dotenv()
-init_db()
 
 app = Flask(__name__)
 
+# OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 THREAD_ID = os.getenv("THREAD_ID")
-DB_NAME = "accountability.db"
+
+# Firestore (auto-auth on Cloud Run)
+db = firestore.Client()
 
 # -------------------------
-# ASSISTANT PLAN GENERATION
+# FIRESTORE HELPERS
 # -------------------------
 
-def generate_plan(prev_data, overall_context):
+def get_latest_day():
+    docs = (
+        db.collection("days")
+        .order_by("day_number", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+    for doc in docs:
+        return doc.to_dict()
+    return None
 
-    message = f"""
-SYSTEM CONTEXT:
-You are Abhijeet's high-performance but calm execution coach.
 
-PREVIOUS DAY UPDATES:
-{prev_data}
+def get_last_7_summaries():
+    docs = (
+        db.collection("days")
+        .order_by("day_number", direction=firestore.Query.DESCENDING)
+        .limit(7)
+        .stream()
+    )
+    summaries = []
+    for d in docs:
+        data = d.to_dict()
+        if data.get("summary"):
+            summaries.append(data["summary"])
+    return "\n".join(summaries)
 
-LONG-TERM TREND (last 7 days):
-{overall_context}
 
-TASK:
-Generate today's response in EXACTLY this structure:
+def get_updates_for_day(day_number):
+    docs = (
+        db.collection("updates")
+        .where("day_number", "==", day_number)
+        .stream()
+    )
+    return [d.to_dict()["text"] for d in docs]
 
-1. Previous Day Feedback
-2. Overall Feedback (Long-Term)
-3. Today's Plan (Time-Blocked, max 4 blocks)
-4. Adjustment Logic
-5. Motivation Quote
 
-Tone rules:
-- Calm
-- Direct
-- No shaming
-- No fluff
-"""
+def create_day(day_number, plan):
+    db.collection("days").document(f"day_{day_number}").set({
+        "day_number": day_number,
+        "date": str(datetime.now().date()),
+        "targets": plan,
+        "summary": None
+    })
 
+
+def save_summary(day_number, summary):
+    db.collection("days").document(f"day_{day_number}").update({
+        "summary": summary
+    })
+
+
+def add_update(day_number, text):
+    db.collection("updates").add({
+        "day_number": day_number,
+        "text": text,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
+
+
+def add_note(text):
+    db.collection("notes").add({
+        "text": text,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
+
+# -------------------------
+# ASSISTANT LOGIC
+# -------------------------
+
+def run_assistant(message):
     client.beta.threads.messages.create(
         thread_id=THREAD_ID,
         role="user",
@@ -80,6 +122,86 @@ Tone rules:
 
     messages = client.beta.threads.messages.list(thread_id=THREAD_ID)
     return messages.data[0].content[0].text.value.strip()
+
+
+def generate_summary(prev_data):
+    prompt = f"""
+Summarize the following day in 2–3 lines for internal tracking.
+Focus on execution, consistency, and gaps.
+No motivation. No advice.
+
+Day data:
+{prev_data}
+"""
+    return run_assistant(prompt)
+
+
+def generate_plan(prev_data, overall_context):
+   prompt = f"""
+SYSTEM ROLE:
+You are Abhijeet’s personal execution trainer.
+Your job is to convert intent into daily execution.
+
+PERSONALITY:
+- Strict but calm
+- Honest, not polite
+- Practical, not theoretical
+- You value consistency over intensity
+- You never shame, but you do not excuse patterns
+
+CONTEXT — PREVIOUS DAY:
+{prev_data}
+
+CONTEXT — LONG-TERM TREND (last 7 days):
+{overall_context}
+
+OBJECTIVE:
+Design today so that Abhijeet makes *measurable progress* even if motivation is low.
+
+You must assume:
+- Time and energy are limited
+- Over-planning causes failure
+- Finishing matters more than expanding scope
+
+OUTPUT FORMAT (FOLLOW EXACTLY):
+
+1. Previous Day Feedback
+- One sentence on what actually moved things forward
+- One sentence on what was avoided or unfinished
+- One clear corrective instruction (not advice)
+
+2. Overall Feedback (Long-Term)
+- Current trajectory: improving / flat / declining
+- One pattern you notice across days
+- One rule Abhijeet should follow today to fix that pattern
+
+3. Today’s Plan (Time-Blocked)
+- Max 3–4 blocks total
+- Each block must include:
+  • Time range (realistic)
+  • Single concrete task
+  • Clear “done” condition
+- Carry forward unfinished *critical* tasks first
+- If yesterday was weak, reduce ambition but protect momentum
+
+4. Execution Guidance
+- Identify the hardest task today
+- Explain how to start it in the *first 10 minutes*
+- Include friction-reduction steps (environment, sequencing, constraints)
+
+5. Motivation Quote
+- Calm, grounded, non-cheesy
+- Focus on discipline, identity, or long-term self-respect
+- One or two lines max
+
+RULES (IMPORTANT):
+- Do not hype.
+- Do not over-encourage.
+- Do not introduce new goals unless necessary.
+- If consistency is breaking, prioritize showing up over optimizing.
+- Assume this will be read once in the morning — make it actionable immediately.
+"""
+   return run_assistant(prompt)
 
 # -------------------------
 # EMAIL
@@ -108,88 +230,31 @@ def send_email(subject, body):
 @app.route("/send_daily_email")
 def send_daily_email():
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+    last_day = get_latest_day()
 
-    # Determine next day number
-    c.execute("SELECT day_number FROM daily_logs ORDER BY id DESC LIMIT 1")
-    last_day = c.fetchone()
-    last_day_number = last_day[0] if last_day else None
-    day_number = (last_day_number or 0) + 1
+    if last_day:
+        last_day_number = last_day["day_number"]
+        updates = get_updates_for_day(last_day_number)
+        prev_data = "\n".join(updates) if updates else "No update submitted."
 
-    # Collect previous day updates
-    if last_day_number:
-        c.execute("""
-            SELECT update_text FROM daily_updates
-            WHERE day_number=?
-        """, (last_day_number,))
-        updates = c.fetchall()
-        prev_data = "\n".join(u[0] for u in updates) if updates else "No update submitted."
+        # Generate & store summary for previous day
+        summary = generate_summary(prev_data)
+        save_summary(last_day_number, summary)
+
     else:
+        last_day_number = 0
         prev_data = "No previous data."
 
-    # -------- Generate & store summary for previous day --------
-    if last_day_number:
-        summary_prompt = f"""
-Summarize the following day in 2–3 lines.
-Focus on execution, consistency, and gaps.
-No motivation.
-
-Day data:
-{prev_data}
-"""
-        client.beta.threads.messages.create(
-            thread_id=THREAD_ID,
-            role="user",
-            content=summary_prompt
-        )
-
-        summary_run = client.beta.threads.runs.create(
-            thread_id=THREAD_ID,
-            assistant_id=ASSISTANT_ID
-        )
-
-        while True:
-            status = client.beta.threads.runs.retrieve(
-                thread_id=THREAD_ID,
-                run_id=summary_run.id
-            )
-            if status.status == "completed":
-                break
-            if status.status in ["failed", "cancelled", "expired"]:
-                break
-            time.sleep(1)
-
-        messages = client.beta.threads.messages.list(thread_id=THREAD_ID)
-        summary_text = messages.data[0].content[0].text.value.strip()
-
-        c.execute("""
-            UPDATE daily_logs
-            SET summary=?
-            WHERE day_number=?
-        """, (summary_text, last_day_number))
-
-    # -------- Long-term context --------
-    c.execute("""
-        SELECT summary FROM daily_logs
-        ORDER BY id DESC LIMIT 7
-    """)
-    summaries = c.fetchall()
-    overall_context = "\n".join(s[0] for s in summaries if s[0])
+    # Long-term context
+    overall_context = get_last_7_summaries()
 
     # Generate today's plan
+    day_number = last_day_number + 1
     plan = generate_plan(prev_data, overall_context)
 
-    # Insert new day
-    c.execute("""
-        INSERT INTO daily_logs (day_number, date, targets)
-        VALUES (?, ?, ?)
-    """, (day_number, str(datetime.now().date()), plan))
-
-    conn.commit()
-    conn.close()
-
+    create_day(day_number, plan)
     send_email(f"Day {day_number}", plan)
+
     return jsonify({"status": "email_sent", "day": day_number})
 
 # -------------------------
@@ -245,21 +310,11 @@ def daily_checkin():
     if not text:
         return redirect(url_for("dashboard"))
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-
-    c.execute("SELECT day_number FROM daily_logs ORDER BY id DESC LIMIT 1")
-    row = c.fetchone()
-    if not row:
+    last_day = get_latest_day()
+    if not last_day:
         return "Generate daily plan first."
 
-    c.execute("""
-        INSERT INTO daily_updates (day_number, update_text, timestamp)
-        VALUES (?, ?, ?)
-    """, (row[0], text, str(datetime.now())))
-
-    conn.commit()
-    conn.close()
+    add_update(last_day["day_number"], text)
     return redirect(url_for("dashboard"))
 
 # -------------------------
@@ -267,19 +322,12 @@ def daily_checkin():
 # -------------------------
 
 @app.route("/add_note", methods=["POST"])
-def add_note():
+def add_note_route():
     note = request.form.get("note")
     if not note:
         return redirect(url_for("dashboard"))
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO strategic_notes (note, timestamp)
-        VALUES (?, ?)
-    """, (note, str(datetime.now())))
-    conn.commit()
-    conn.close()
+    add_note(note)
 
     client.beta.threads.messages.create(
         thread_id=THREAD_ID,
@@ -290,7 +338,7 @@ def add_note():
     return redirect(url_for("dashboard"))
 
 # -------------------------
-# RUN LOCAL
+# RUN
 # -------------------------
 
 if __name__ == "__main__":

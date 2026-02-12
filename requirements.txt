@@ -1,4 +1,7 @@
 flask
 openai
-python-dotenv
 gunicorn
+google-cloud-firestore
+python-dotenv
+
+
